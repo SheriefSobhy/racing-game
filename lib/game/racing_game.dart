@@ -1,4 +1,5 @@
 import 'dart:math';
+import 'dart:ui';
 
 import 'package:flame/events.dart';
 import 'package:flame/game.dart';
@@ -8,12 +9,18 @@ import '../screens/game_over_screen.dart';
 import '../screens/hud.dart';
 import '../screens/start_screen.dart';
 import '../services/score_storage.dart';
+import 'components/background.dart';
 import 'components/coin.dart';
 import 'components/enemy_car.dart';
 import 'components/player_car.dart';
 import 'components/road.dart';
+import 'components/scenery.dart';
+import 'components/speed_effects.dart';
+import 'perspective.dart';
+import 'track.dart';
 
-/// The main game: owns the road, the player, spawning, scoring and game state.
+/// The main game: owns the 3D camera, the track, everything on the road,
+/// spawning, scoring and game state.
 class RacingGame extends FlameGame with TapCallbacks, DragCallbacks {
   RacingGame({required this.storage, required this.bestScore});
 
@@ -21,6 +28,14 @@ class RacingGame extends FlameGame with TapCallbacks, DragCallbacks {
 
   /// Score needed to reach top speed.
   static const double maxDifficultyScore = 3000;
+
+  // Speeds in world units per second.
+  static const double idleSpeed = 3500;
+  static const double startSpeed = 7000;
+  static const double maxSpeed = 16000;
+
+  /// Enemy cars drive at this fraction of our speed, so we catch up to them.
+  static const double enemySpeedRatio = 0.35;
 
   final ScoreStorage storage;
   final Random random = Random();
@@ -34,90 +49,151 @@ class RacingGame extends FlameGame with TapCallbacks, DragCallbacks {
   bool isPlaying = false;
   bool isGameOver = false;
 
+  final Perspective view = Perspective();
+  final Track track = Track();
+  final List<SceneryItem> scenery = [];
+  final List<EnemyCar> enemies = [];
+  final List<Coin> coins = [];
+
   late final PlayerCar player;
+  late final SpeedEffects _effects;
+
+  /// Current speed in world units per second.
+  double speed = idleSpeed;
+
+  /// How far the background has slid sideways because of curves.
+  double skyOffset = 0;
 
   double _score = 0;
   double _enemyTimer = 0;
   double _coinTimer = 0;
   double _dragDistanceX = 0;
-
-  // ---------------------------------------------------------------------------
-  // Layout helpers (everything scales with the screen size).
-  // ---------------------------------------------------------------------------
-
-  /// Width of the grass on each side of the road.
-  double get roadLeft => size.x * 0.09;
-  double get roadWidth => size.x - roadLeft * 2;
-  double get laneWidth => roadWidth / laneCount;
-  double laneCenterX(int lane) => roadLeft + laneWidth * (lane + 0.5);
-
-  /// Car size based on lane width, but never too tall on wide screens.
-  Vector2 get carSize {
-    var width = laneWidth * 0.56;
-    var height = width * 1.8;
-    final maxHeight = size.y * 0.14;
-    if (height > maxHeight) {
-      height = maxHeight;
-      width = height / 1.8;
-    }
-    return Vector2(width, height);
-  }
-
-  double get coinRadius => min(laneWidth * 0.17, size.y * 0.03);
+  double _nextSceneryZ = 0;
+  double _crashShake = 0;
 
   /// 0.0 at the start, 1.0 at top speed.
   double get difficulty => (_score / maxDifficultyScore).clamp(0.0, 1.0);
 
-  /// Road speed in pixels per second (relative to screen height).
-  double get speed {
-    if (isGameOver) return 0;
-    if (!isPlaying) return size.y * 0.35; // gentle scrolling on start screen
-    return size.y * (0.6 + 0.9 * difficulty);
-  }
+  /// Current speed as a fraction of top speed (0..1).
+  double get speedFactor => speed / maxSpeed;
+
+  double get playerZ => view.cameraZ + Perspective.playerDistance;
 
   // ---------------------------------------------------------------------------
   // Lifecycle
   // ---------------------------------------------------------------------------
 
   @override
+  void onGameResize(Vector2 size) {
+    // The camera must know the new size before the components rebuild
+    // their gradients and shapes.
+    view.resize(size.x, size.y);
+    super.onGameResize(size);
+  }
+
+  @override
   Future<void> onLoad() async {
-    add(Road());
     player = PlayerCar();
-    add(player);
+    _effects = SpeedEffects();
+    addAll([Background(), Road(), player, _effects]);
+    _spawnScenery();
   }
 
   @override
   void update(double dt) {
+    // Avoid huge jumps after a hiccup or when the tab was in the background.
+    dt = min(dt, 1 / 30);
+
+    _updateSpeed(dt);
+    view.cameraZ += speed * dt;
+    view.cameraX = player.x * 0.55; // camera follows the car part of the way
+
+    final playerSegment = (playerZ / Perspective.segmentLength).floor();
+    skyOffset += track.curveAt(playerSegment) * speedFactor * dt * 0.5;
+
+    _spawnScenery();
+    scenery.removeWhere((s) => s.z < view.cameraZ);
+
+    // After a crash, cars brake together with us so the scene "freezes"
+    // with the car we hit right in front.
+    final enemySpeed = isGameOver ? speed : speed * enemySpeedRatio;
+    for (final enemy in enemies) {
+      enemy.z += enemySpeed * dt;
+    }
+    enemies.removeWhere((e) => e.z < playerZ - 800);
+
+    for (final coin in coins) {
+      coin.update(dt);
+    }
+    coins.removeWhere((c) => c.isRemoved || c.z < playerZ - 800);
+
+    if (isPlaying) {
+      _score += dt * 15;
+      final shownScore = _score.floor();
+      if (shownScore != scoreNotifier.value) scoreNotifier.value = shownScore;
+
+      _enemyTimer -= dt;
+      if (_enemyTimer <= 0) _spawnEnemies();
+
+      _coinTimer -= dt;
+      if (_coinTimer <= 0) _spawnCoins();
+
+      _checkCollisions();
+    }
+
+    if (_crashShake > 0) _crashShake = max(0, _crashShake - dt * 1.8);
+
     super.update(dt);
-    if (!isPlaying) return;
+  }
 
-    _score += dt * 15;
-    final shownScore = _score.floor();
-    if (shownScore != scoreNotifier.value) scoreNotifier.value = shownScore;
+  void _updateSpeed(double dt) {
+    final double target;
+    if (isGameOver) {
+      target = 0;
+    } else if (isPlaying) {
+      target = startSpeed + (maxSpeed - startSpeed) * difficulty;
+    } else {
+      target = idleSpeed;
+    }
+    if (speed < target) {
+      speed = min(target, speed + 5000 * dt);
+    } else {
+      // Brake hard after a crash, ease off otherwise.
+      speed = max(target, speed - (isGameOver ? 22000 : 6000) * dt);
+    }
+  }
 
-    _enemyTimer -= dt;
-    if (_enemyTimer <= 0) _spawnEnemies();
-
-    _coinTimer -= dt;
-    if (_coinTimer <= 0) _spawnCoin();
-
-    _checkCollisions();
+  /// Wraps the whole scene in a small random offset for screen shake.
+  @override
+  void render(Canvas canvas) {
+    var amount = _crashShake * 10;
+    if (isPlaying) {
+      amount += ((speedFactor - 0.7) / 0.3).clamp(0.0, 1.0) * 1.6;
+    }
+    if (amount < 0.05) {
+      super.render(canvas);
+      return;
+    }
+    canvas.save();
+    canvas.translate(
+      (random.nextDouble() * 2 - 1) * amount,
+      (random.nextDouble() * 2 - 1) * amount,
+    );
+    super.render(canvas);
+    canvas.restore();
   }
 
   void startGame() {
-    for (final enemy in children.whereType<EnemyCar>()) {
-      enemy.removeFromParent();
-    }
-    for (final coin in children.whereType<Coin>()) {
-      coin.removeFromParent();
-    }
+    enemies.clear();
+    coins.clear();
 
     _score = 0;
     scoreNotifier.value = 0;
     coinsNotifier.value = 0;
     isNewBest = false;
-    _enemyTimer = 1.0;
-    _coinTimer = 0.6;
+    _enemyTimer = 1.2;
+    _coinTimer = 0.5;
+    _crashShake = 0;
     player.reset();
 
     isGameOver = false;
@@ -128,10 +204,14 @@ class RacingGame extends FlameGame with TapCallbacks, DragCallbacks {
     overlays.add(Hud.overlayName);
   }
 
-  void _gameOver() {
+  void _gameOver(EnemyCar hitCar) {
     isPlaying = false;
     isGameOver = true;
     player.crash();
+    _effects.flash();
+    _crashShake = 1;
+    // Keep the car we hit just in front of us instead of inside us.
+    hitCar.z = max(hitCar.z, playerZ + 240);
 
     final finalScore = scoreNotifier.value;
     if (finalScore > bestScore) {
@@ -148,22 +228,24 @@ class RacingGame extends FlameGame with TapCallbacks, DragCallbacks {
   // Spawning
   // ---------------------------------------------------------------------------
 
-  /// A lane is free at the top if nothing was spawned there recently.
-  bool _isLaneFreeAtTop(int lane) {
-    final limit = carSize.y * 1.6;
-    for (final enemy in children.whereType<EnemyCar>()) {
-      if (enemy.lane == lane && enemy.position.y < limit) return false;
+  /// New cars and coins appear this far ahead (small, near the horizon).
+  double get _spawnZ => view.cameraZ + Perspective.drawDistance * 0.6;
+
+  bool _isLaneFree(int lane, double z, double range) {
+    for (final enemy in enemies) {
+      if (enemy.lane == lane && (enemy.z - z).abs() < range) return false;
     }
-    for (final coin in children.whereType<Coin>()) {
-      if (coin.lane == lane && coin.position.y < limit) return false;
+    for (final coin in coins) {
+      if (coin.lane == lane && (coin.z - z).abs() < range) return false;
     }
     return true;
   }
 
   void _spawnEnemies() {
+    final z = _spawnZ;
     final freeLanes = [
       for (var lane = 0; lane < laneCount; lane++)
-        if (_isLaneFreeAtTop(lane)) lane,
+        if (_isLaneFree(lane, z, 2600)) lane,
     ]..shuffle(random);
 
     if (freeLanes.isEmpty) {
@@ -171,51 +253,128 @@ class RacingGame extends FlameGame with TapCallbacks, DragCallbacks {
       return;
     }
 
-    // Sometimes spawn two cars side by side, but always leave one lane open.
+    // Sometimes two cars side by side, but always leave one lane open.
     final twoCars =
         freeLanes.length >= 2 && random.nextDouble() < 0.1 + 0.3 * difficulty;
     final count = twoCars ? 2 : 1;
     for (var i = 0; i < count; i++) {
-      add(EnemyCar(lane: freeLanes[i]));
+      enemies.add(EnemyCar(
+        lane: freeLanes[i],
+        z: z,
+        color: EnemyCar.colors[random.nextInt(EnemyCar.colors.length)],
+      ));
     }
 
-    // Spawn faster as difficulty rises.
-    final interval = 1.3 - 0.6 * difficulty;
+    // Spawn more often as difficulty rises.
+    final interval = 1.4 - 0.7 * difficulty;
     _enemyTimer = interval * (0.85 + random.nextDouble() * 0.3);
   }
 
-  void _spawnCoin() {
-    // Coins move faster than enemies, so avoid lanes with any enemy on screen.
-    final enemyLanes =
-        children.whereType<EnemyCar>().map((e) => e.lane).toSet();
+  /// Spawns a short trail of coins in a lane with no cars ahead.
+  void _spawnCoins() {
+    final z = _spawnZ;
+    // Coins are faster than cars (they don't move), so never put them in
+    // a lane where a car is still ahead of us.
+    final busyLanes = {
+      for (final e in enemies)
+        if (e.z > playerZ - 300) e.lane,
+    };
     final lanes = [
       for (var lane = 0; lane < laneCount; lane++)
-        if (!enemyLanes.contains(lane) && _isLaneFreeAtTop(lane)) lane,
+        if (!busyLanes.contains(lane) && _isLaneFree(lane, z, 3000)) lane,
     ];
 
     if (lanes.isNotEmpty) {
-      add(Coin(lane: lanes[random.nextInt(lanes.length)]));
+      final lane = lanes[random.nextInt(lanes.length)];
+      final count = 3 + random.nextInt(3);
+      for (var i = 0; i < count; i++) {
+        coins.add(Coin(
+          lane: lane,
+          z: z - i * 550,
+          spin: i * 0.4,
+        ));
+      }
     }
-    _coinTimer = 0.7 + random.nextDouble() * 0.8;
+    _coinTimer = 1.6 + random.nextDouble() * 1.4;
+  }
+
+  /// Fills the roadside with trees, lamps, signs and curve chevrons.
+  void _spawnScenery() {
+    const segLen = Perspective.segmentLength;
+    const rw = Perspective.roadHalfWidth;
+    final limit = view.cameraZ + Perspective.drawDistance;
+
+    while (_nextSceneryZ < limit) {
+      final z = _nextSceneryZ;
+      final segment = (z / segLen).floor();
+      final curve = track.curveAt(segment);
+
+      if (segment % 12 == 0) {
+        // Street lamps on both sides with arms over the road.
+        scenery.add(SceneryItem(
+            type: SceneryType.lamp, x: -rw * 1.22, z: z, facing: 1));
+        scenery.add(SceneryItem(
+            type: SceneryType.lamp, x: rw * 1.22, z: z, facing: -1));
+      } else if (curve.abs() > 0.5 && segment % 4 == 0) {
+        // Chevrons on the outside of the bend, pointing into it.
+        final side = curve > 0 ? -1.0 : 1.0;
+        scenery.add(SceneryItem(
+          type: SceneryType.chevron,
+          x: side * rw * 1.25,
+          z: z,
+          facing: curve > 0 ? 1 : -1,
+        ));
+      } else if (segment % 41 == 7) {
+        final side = random.nextBool() ? 1.0 : -1.0;
+        scenery.add(SceneryItem(
+          type: SceneryType.billboard,
+          x: side * rw * 2.0,
+          z: z,
+          variant: random.nextInt(4),
+        ));
+      }
+
+      // Trees and bushes, further out from the road.
+      for (final side in const [-1.0, 1.0]) {
+        if (random.nextDouble() < 0.24) {
+          final roll = random.nextDouble();
+          final type = roll < 0.45
+              ? SceneryType.pine
+              : roll < 0.8
+                  ? SceneryType.roundTree
+                  : SceneryType.bush;
+          scenery.add(SceneryItem(
+            type: type,
+            x: side * rw * (1.6 + random.nextDouble() * 2.4),
+            z: z + random.nextDouble() * segLen,
+          ));
+        }
+      }
+
+      _nextSceneryZ += segLen;
+    }
   }
 
   // ---------------------------------------------------------------------------
-  // Collisions
+  // Collisions (in world space, only near the player)
   // ---------------------------------------------------------------------------
 
   void _checkCollisions() {
-    final playerRect = player.hitRect;
+    final pz = playerZ;
+    final px = player.x;
+    final carWidth = player.worldWidth;
 
-    for (final enemy in children.whereType<EnemyCar>()) {
-      if (enemy.hitRect.overlaps(playerRect)) {
-        _gameOver();
+    for (final enemy in enemies) {
+      if ((enemy.z - pz).abs() < 230 &&
+          (enemy.x - px).abs() < carWidth * 0.82) {
+        _gameOver(enemy);
         return;
       }
     }
 
-    for (final coin in children.whereType<Coin>()) {
+    for (final coin in coins) {
       if (coin.isCollected) continue;
-      if (coin.hitRect.overlaps(playerRect)) {
+      if ((coin.z - pz).abs() < 300 && (coin.x - px).abs() < carWidth * 0.85) {
         coin.collect();
         coinsNotifier.value++;
       }

@@ -3,32 +3,35 @@ import 'dart:ui';
 
 import 'package:flame/components.dart';
 
+import '../perspective.dart';
 import '../racing_game.dart';
 import 'car_painter.dart';
+import 'enemy_car.dart';
 
-/// The player's car near the bottom of the screen. Moves one lane at a time.
-class PlayerCar extends PositionComponent with HasGameReference<RacingGame> {
-  PlayerCar() : super(anchor: Anchor.center, priority: 2);
+/// The player's car, seen from behind. It slides between lanes and tilts
+/// a little while changing lanes.
+class PlayerCar extends Component with HasGameReference<RacingGame> {
+  PlayerCar() : super(priority: 2);
 
   static const int startLane = 1;
+  static const Color bodyColor = Color(0xFFE53935);
 
   int lane = startLane;
+
+  /// Current sideways position in world units (glides towards the lane).
+  double x = Perspective.laneX(startLane);
+
+  double _tilt = 0;
+  double _time = 0;
   bool _crashed = false;
   double _crashTime = 0;
 
-  @override
-  Future<void> onLoad() async {
-    _layout();
-    position.x = game.laneCenterX(lane);
-  }
-
   void reset() {
     lane = startLane;
+    x = Perspective.laneX(lane);
+    _tilt = 0;
     _crashed = false;
     _crashTime = 0;
-    angle = 0;
-    _layout();
-    position.x = game.laneCenterX(lane);
   }
 
   void moveLeft() => lane = max(0, lane - 1);
@@ -40,45 +43,55 @@ class PlayerCar extends PositionComponent with HasGameReference<RacingGame> {
     _crashTime = 0;
   }
 
-  /// Slightly smaller than the drawing so near-misses feel fair.
-  Rect get hitRect => Rect.fromCenter(
-        center: position.toOffset(),
-        width: size.x * 0.8,
-        height: size.y * 0.88,
-      );
-
-  void _layout() {
-    size = game.carSize;
-    position.y = game.size.y - size.y * 0.75 - game.size.y * 0.05;
-  }
+  /// Car width in world units, used for collisions.
+  double get worldWidth => EnemyCar.worldWidth;
 
   @override
   void update(double dt) {
-    _layout();
-
+    _time += dt;
     if (_crashed) {
-      // Little spin-out wobble after a crash.
       _crashTime += dt;
-      angle = sin(_crashTime * 30) * 0.25 * max(0, 1 - _crashTime * 2);
+      // Spin-out wobble that settles down.
+      _tilt = sin(_crashTime * 28) * 0.22 * max(0.0, 1 - _crashTime * 1.5);
       return;
     }
 
-    // Glide smoothly towards the target lane.
-    final targetX = game.laneCenterX(lane);
-    final t = min(1.0, dt * 14);
-    position.x += (targetX - position.x) * t;
+    final targetX = Perspective.laneX(lane);
+    final previousX = x;
+    x += (targetX - x) * min(1.0, dt * 12);
 
-    // Lean a little while changing lanes.
-    angle = ((targetX - position.x) / game.laneWidth) * 0.35;
+    // Tilt (roll) towards the direction of travel while changing lanes.
+    final lateralSpeed = dt > 0 ? (x - previousX) / dt : 0.0;
+    final targetTilt = (lateralSpeed / 4000).clamp(-0.14, 0.14);
+    _tilt += (targetTilt - _tilt) * min(1.0, dt * 14);
   }
 
   @override
   void render(Canvas canvas) {
-    paintCar(
+    final view = game.view;
+    final z = view.cameraZ + Perspective.playerDistance;
+    final point = view.project(x, z);
+    final pixelWidth = worldWidth * point.scale * 1.05;
+
+    // A tiny bounce from the road surface, stronger at speed.
+    final speedFactor = game.speedFactor;
+    final bounce = _crashed
+        ? 0.0
+        : sin(_time * 38) * speedFactor * pixelWidth * 0.006 +
+            sin(_time * 13) * pixelWidth * 0.004;
+
+    canvas.save();
+    canvas.translate(point.x, point.y + bounce);
+    canvas.rotate(_tilt);
+    canvas.scale(pixelWidth);
+    CarPainter.paintCar(
       canvas,
-      size.toSize(),
-      bodyColor: const Color(0xFFE53935),
-      stripeColor: const Color(0xFFFFFFFF),
+      body: bodyColor,
+      lean: (point.x - view.centerX) / view.width * 2 - _tilt * 2,
+      isPlayer: true,
+      boost: _crashed ? 0 : ((speedFactor - 0.45) / 0.55).clamp(0.0, 1.0),
+      time: _time,
     );
+    canvas.restore();
   }
 }
