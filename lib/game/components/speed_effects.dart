@@ -5,20 +5,22 @@ import 'package:flame/components.dart';
 
 import '../racing_game.dart';
 
-/// Speed lines rushing out from the horizon, a soft vignette, and a red
-/// flash when crashing.
+/// Speed lines rushing out from the horizon at high speed, and a short red
+/// flash when crashing. Speed lines are turned off in low quality.
+///
+/// Performance: one reused Path and Paint; all lines are drawn in a single
+/// call. No vignette or other full-screen gradients.
 class SpeedEffects extends Component with HasGameReference<RacingGame> {
   SpeedEffects() : super(priority: 3);
 
-  static const int _lineCount = 26;
+  static const int _lineCount = 14;
 
   final _random = Random();
   final List<_Streak> _streaks = [];
   final Path _linePath = Path();
   final Paint _linePaint = Paint()
     ..style = PaintingStyle.stroke
-    ..strokeCap = StrokeCap.round;
-  final Paint _vignettePaint = Paint();
+    ..strokeCap = StrokeCap.butt;
   final Paint _flashPaint = Paint();
 
   double _flash = 0;
@@ -28,12 +30,6 @@ class SpeedEffects extends Component with HasGameReference<RacingGame> {
   @override
   void onGameResize(Vector2 size) {
     super.onGameResize(size);
-    _vignettePaint.shader = Gradient.radial(
-      Offset(size.x / 2, size.y * 0.55),
-      max(size.x, size.y) * 0.75,
-      const [Color(0x00000000), Color(0x00000000), Color(0x66000000)],
-      const [0.0, 0.6, 1.0],
-    );
     _linePaint.strokeWidth = max(1.5, size.x * 0.005);
   }
 
@@ -46,7 +42,7 @@ class SpeedEffects extends Component with HasGameReference<RacingGame> {
 
   @override
   void update(double dt) {
-    if (_flash > 0) _flash = max(0, _flash - dt * 2.5);
+    if (_flash > 0) _flash = max(0, _flash - dt * 3);
     final speed = game.speedFactor;
     for (final s in _streaks) {
       s.distance += dt * (0.6 + speed * 2.4) * (0.4 + s.distance);
@@ -60,9 +56,9 @@ class SpeedEffects extends Component with HasGameReference<RacingGame> {
     final w = view.width;
     final h = view.height;
 
-    // Speed lines appear above about 45% of top speed.
-    final strength = ((game.speedFactor - 0.45) / 0.55).clamp(0.0, 1.0);
-    if (strength > 0 && game.isPlaying) {
+    // Speed lines appear above about 50% of top speed (high quality only).
+    final strength = ((game.speedFactor - 0.5) / 0.5).clamp(0.0, 1.0);
+    if (strength > 0 && game.isPlaying && !game.isLowQuality) {
       final vx = view.centerX;
       final vy = view.horizonY;
       final reach = sqrt(w * w + h * h) * 0.75;
@@ -74,15 +70,13 @@ class SpeedEffects extends Component with HasGameReference<RacingGame> {
           ..moveTo(vx + s.dx * start, vy + s.dy * start)
           ..lineTo(vx + s.dx * end, vy + s.dy * end);
       }
-      _linePaint.color = Color.fromRGBO(255, 255, 255, 0.35 * strength);
+      _linePaint.color = Color.fromRGBO(255, 255, 255, 0.3 * strength);
       canvas.drawPath(_linePath, _linePaint);
     }
 
-    canvas.drawRect(Rect.fromLTRB(-30, -30, w + 30, h + 30), _vignettePaint);
-
     if (_flash > 0) {
-      _flashPaint.color = Color.fromRGBO(255, 60, 40, 0.45 * _flash);
-      canvas.drawRect(Rect.fromLTRB(-30, -30, w + 30, h + 30), _flashPaint);
+      _flashPaint.color = Color.fromRGBO(255, 60, 40, 0.4 * _flash);
+      canvas.drawRect(Rect.fromLTRB(-40, -40, w + 40, h + 40), _flashPaint);
     }
   }
 }
@@ -94,10 +88,10 @@ class _Streak {
   double distance = 0;
 
   void reset(Random random, {bool scatter = false}) {
-    // Mostly sideways and downwards, away from the sky's centre.
+    // Out to the sides and downwards, away from the sky.
     final angle = random.nextBool()
-        ? -0.35 + random.nextDouble() * 1.5 // right side
-        : pi + 0.35 - random.nextDouble() * 1.5; // left side
+        ? -0.2 + random.nextDouble() * 1.3 // right side
+        : pi + 0.2 - random.nextDouble() * 1.3; // left side
     dx = cos(angle);
     dy = sin(angle);
     distance = scatter ? 0.35 + random.nextDouble() : 0.35;

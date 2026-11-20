@@ -37,6 +37,7 @@ class EnemyCar extends WorldObject {
     CarPainter.paintCar(
       canvas,
       body: color,
+      pixelWidth: pixelWidth,
       lean: (point.x - view.centerX) / view.width * 2,
     );
     canvas.restore();

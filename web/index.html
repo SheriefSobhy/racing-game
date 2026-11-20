@@ -49,6 +49,30 @@
   </style>
 </head>
 <body>
+  <script>
+    // Cap the rendering resolution: phones with 3x screens would otherwise
+    // draw 2.25x more pixels than at 2x for almost no visible difference.
+    // The game can lower the cap further (low quality) via
+    // laneRushSetDprCap(), which makes Flutter re-read the size.
+    (function () {
+      var realDpr = window.devicePixelRatio || 1;
+      window.__laneRushDprCap = 2;
+      try {
+        Object.defineProperty(window, 'devicePixelRatio', {
+          get: function () { return Math.min(realDpr, window.__laneRushDprCap); },
+          configurable: true
+        });
+      } catch (e) {}
+      window.laneRushSetDprCap = function (cap) {
+        window.__laneRushDprCap = cap;
+        var fire = function (target) {
+          try { target.dispatchEvent(new Event('resize')); } catch (e) {}
+        };
+        fire(window);
+        if (window.visualViewport) fire(window.visualViewport);
+      };
+    })();
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>

@@ -18,6 +18,7 @@ import 'components/scenery.dart';
 import 'components/speed_effects.dart';
 import 'perspective.dart';
 import 'track.dart';
+import '../platform/web_tweaks.dart';
 
 /// The main game: owns the 3D camera, the track, everything on the road,
 /// spawning, scoring and game state.
@@ -36,6 +37,25 @@ class RacingGame extends FlameGame with TapCallbacks, DragCallbacks {
 
   /// Enemy cars drive at this fraction of our speed, so we catch up to them.
   static const double enemySpeedRatio = 0.35;
+
+  /// Below this frame rate (for a couple of seconds) we switch to low quality.
+  static const double lowQualityFps = 50;
+
+  /// Show the FPS counter when the page URL has ?debug.
+  final bool showFps = Uri.base.queryParameters.containsKey('debug');
+
+  /// Text for the debug FPS counter.
+  final ValueNotifier<String> debugInfo = ValueNotifier('');
+
+  /// Low quality: fewer roadside objects and cars, no speed lines, no screen
+  /// shake and a lower rendering resolution. Switched on automatically.
+  bool isLowQuality = false;
+
+  double _fpsTime = 0;
+  int _fpsFrames = 0;
+  double _slowTime = 0;
+  double _runTime = 0;
+  double _fps = 60;
 
   final ScoreStorage storage;
   final Random random = Random();
@@ -79,6 +99,13 @@ class RacingGame extends FlameGame with TapCallbacks, DragCallbacks {
 
   double get playerZ => view.cameraZ + Perspective.playerDistance;
 
+  /// The screen's current device pixel ratio.
+  double get pixelRatio =>
+      PlatformDispatcher.instance.implicitView?.devicePixelRatio ?? 1.0;
+
+  int get _maxEnemies => isLowQuality ? 4 : 6;
+  int get _maxCoins => isLowQuality ? 6 : 10;
+
   // ---------------------------------------------------------------------------
   // Lifecycle
   // ---------------------------------------------------------------------------
@@ -101,8 +128,11 @@ class RacingGame extends FlameGame with TapCallbacks, DragCallbacks {
 
   @override
   void update(double dt) {
+    _measureFps(dt);
+
     // Avoid huge jumps after a hiccup or when the tab was in the background.
     dt = min(dt, 1 / 30);
+    _runTime += dt;
 
     _updateSpeed(dt);
     view.cameraZ += speed * dt;
@@ -163,24 +193,79 @@ class RacingGame extends FlameGame with TapCallbacks, DragCallbacks {
     }
   }
 
-  /// Wraps the whole scene in a small random offset for screen shake.
+  /// Wraps the whole scene in a small offset for screen shake.
+  /// The shake follows smooth waves (not random jumps) so it never looks
+  /// like flicker. Off in low quality, except a short bump on a crash.
   @override
   void render(Canvas canvas) {
-    var amount = _crashShake * 10;
-    if (isPlaying) {
-      amount += ((speedFactor - 0.7) / 0.3).clamp(0.0, 1.0) * 1.6;
+    var amount = _crashShake * 7;
+    if (isPlaying && !isLowQuality) {
+      amount += ((speedFactor - 0.75) / 0.25).clamp(0.0, 1.0) * 1.2;
     }
-    if (amount < 0.05) {
+    if (amount < 0.1) {
       super.render(canvas);
       return;
     }
+    final t = _runTime;
     canvas.save();
     canvas.translate(
-      (random.nextDouble() * 2 - 1) * amount,
-      (random.nextDouble() * 2 - 1) * amount,
+      amount * (sin(t * 31) * 0.6 + sin(t * 17.3) * 0.4),
+      amount * (cos(t * 27) * 0.6 + sin(t * 13.1) * 0.4),
     );
     super.render(canvas);
     canvas.restore();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Frame rate and automatic quality
+  // ---------------------------------------------------------------------------
+
+  void _measureFps(double rawDt) {
+    if (rawDt > 0.25) {
+      // A long pause (e.g. the tab was hidden): start measuring again.
+      _fpsTime = 0;
+      _fpsFrames = 0;
+      return;
+    }
+    _fpsTime += rawDt;
+    _fpsFrames++;
+    if (_fpsTime < 0.5) return;
+
+    _fps = _fpsFrames / _fpsTime;
+    _fpsTime = 0;
+    _fpsFrames = 0;
+
+    // Give the page a few seconds to settle, then watch for slow frames.
+    if (!isLowQuality && _runTime > 3) {
+      _slowTime = _fps < lowQualityFps ? _slowTime + 0.5 : 0;
+      if (_slowTime >= 2) setLowQuality();
+    }
+
+    if (showFps) {
+      debugInfo.value = '${_fps.round()} FPS · '
+          '${isLowQuality ? 'LOW' : 'HIGH'} · '
+          '${pixelRatio.toStringAsFixed(1)}x';
+    }
+  }
+
+  /// Switches to low quality: fewer objects, no speed lines or shake and a
+  /// lower resolution in the browser.
+  void setLowQuality() {
+    if (isLowQuality) return;
+    isLowQuality = true;
+    setResolutionCap(1.5);
+
+    // Thin out the roadside right away (keep lamps and chevrons).
+    var i = 0;
+    scenery.removeWhere((s) {
+      i++;
+      return s.type == SceneryType.bush ||
+          ((s.type == SceneryType.pine || s.type == SceneryType.roundTree) &&
+              i.isEven);
+    });
+    while (enemies.length > _maxEnemies) {
+      enemies.removeAt(0);
+    }
   }
 
   void startGame() {
@@ -242,6 +327,10 @@ class RacingGame extends FlameGame with TapCallbacks, DragCallbacks {
   }
 
   void _spawnEnemies() {
+    if (enemies.length >= _maxEnemies) {
+      _enemyTimer = 0.2;
+      return;
+    }
     final z = _spawnZ;
     final freeLanes = [
       for (var lane = 0; lane < laneCount; lane++)
@@ -256,7 +345,7 @@ class RacingGame extends FlameGame with TapCallbacks, DragCallbacks {
     // Sometimes two cars side by side, but always leave one lane open.
     final twoCars =
         freeLanes.length >= 2 && random.nextDouble() < 0.1 + 0.3 * difficulty;
-    final count = twoCars ? 2 : 1;
+    final count = min(twoCars ? 2 : 1, _maxEnemies - enemies.length);
     for (var i = 0; i < count; i++) {
       enemies.add(EnemyCar(
         lane: freeLanes[i],
@@ -284,9 +373,10 @@ class RacingGame extends FlameGame with TapCallbacks, DragCallbacks {
         if (!busyLanes.contains(lane) && _isLaneFree(lane, z, 3000)) lane,
     ];
 
-    if (lanes.isNotEmpty) {
+    final room = _maxCoins - coins.length;
+    if (lanes.isNotEmpty && room >= 3) {
       final lane = lanes[random.nextInt(lanes.length)];
-      final count = 3 + random.nextInt(3);
+      final count = min(3 + random.nextInt(3), room);
       for (var i = 0; i < count; i++) {
         coins.add(Coin(
           lane: lane,
@@ -309,13 +399,13 @@ class RacingGame extends FlameGame with TapCallbacks, DragCallbacks {
       final segment = (z / segLen).floor();
       final curve = track.curveAt(segment);
 
-      if (segment % 12 == 0) {
+      if (segment % (isLowQuality ? 24 : 12) == 0) {
         // Street lamps on both sides with arms over the road.
         scenery.add(SceneryItem(
             type: SceneryType.lamp, x: -rw * 1.22, z: z, facing: 1));
         scenery.add(SceneryItem(
             type: SceneryType.lamp, x: rw * 1.22, z: z, facing: -1));
-      } else if (curve.abs() > 0.5 && segment % 4 == 0) {
+      } else if (curve.abs() > 0.5 && segment % (isLowQuality ? 8 : 5) == 0) {
         // Chevrons on the outside of the bend, pointing into it.
         final side = curve > 0 ? -1.0 : 1.0;
         scenery.add(SceneryItem(
@@ -335,12 +425,13 @@ class RacingGame extends FlameGame with TapCallbacks, DragCallbacks {
       }
 
       // Trees and bushes, further out from the road.
+      final treeChance = isLowQuality ? 0.06 : 0.13;
       for (final side in const [-1.0, 1.0]) {
-        if (random.nextDouble() < 0.24) {
+        if (random.nextDouble() < treeChance) {
           final roll = random.nextDouble();
-          final type = roll < 0.45
+          final type = roll < 0.5
               ? SceneryType.pine
-              : roll < 0.8
+              : roll < 0.85 || isLowQuality
                   ? SceneryType.roundTree
                   : SceneryType.bush;
           scenery.add(SceneryItem(

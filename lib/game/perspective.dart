@@ -4,12 +4,13 @@ import 'track.dart';
 
 /// A point on the screen plus how much the world is scaled there
 /// (screen pixels per world unit).
+///
+/// [Perspective.project] reuses one instance to avoid creating garbage
+/// every frame, so read the values straight away.
 class ScreenPoint {
-  const ScreenPoint(this.x, this.y, this.scale);
-
-  final double x;
-  final double y;
-  final double scale;
+  double x = 0;
+  double y = 0;
+  double scale = 0;
 }
 
 /// The pseudo-3D camera. It turns world positions (x across the road,
@@ -24,6 +25,9 @@ class Perspective {
   static const int drawSegments = 160;
   static const double drawDistance = segmentLength * drawSegments;
   static const double playerDistance = 1000;
+
+  /// Haze colour that the far road, grass and sky all fade into.
+  static const int hazeColor = 0xFFE9C9B6;
 
   /// Lane centres in world x: left, middle, right.
   static double laneX(int lane) => (lane - 1) * roadHalfWidth * 2 / 3;
@@ -83,12 +87,17 @@ class Perspective {
     return _curveX[n] + (_curveX[n + 1] - _curveX[n]) * f;
   }
 
+  final ScreenPoint _point = ScreenPoint();
+
   /// Projects a point on the road surface to the screen.
+  /// The returned object is reused by the next call.
   ScreenPoint project(double worldX, double worldZ) {
     final dz = worldZ - cameraZ;
     final scale = focal / dz;
-    final x = centerX + (worldX + curveXAtZ(worldZ) - cameraX) * scale;
-    final y = horizonY + cameraHeight * scale;
-    return ScreenPoint(x, y, scale);
+    _point
+      ..scale = scale
+      ..x = centerX + (worldX + curveXAtZ(worldZ) - cameraX) * scale
+      ..y = horizonY + cameraHeight * scale;
+    return _point;
   }
 }

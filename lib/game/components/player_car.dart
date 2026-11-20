@@ -87,6 +87,7 @@ class PlayerCar extends Component with HasGameReference<RacingGame> {
     CarPainter.paintCar(
       canvas,
       body: bodyColor,
+      pixelWidth: pixelWidth,
       lean: (point.x - view.centerX) / view.width * 2 - _tilt * 2,
       isPlayer: true,
       boost: _crashed ? 0 : ((speedFactor - 0.45) / 0.55).clamp(0.0, 1.0),

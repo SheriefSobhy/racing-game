@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'game/racing_game.dart';
+import 'screens/fps_counter.dart';
 import 'screens/game_over_screen.dart';
 import 'screens/hud.dart';
 import 'screens/start_screen.dart';
@@ -60,8 +61,13 @@ class _RacingAppState extends State<RacingApp> {
                 height: constraints.maxHeight,
                 child: GameWidget<RacingGame>(
                   game: _game,
-                  initialActiveOverlays: const [StartScreen.overlayName],
+                  initialActiveOverlays: [
+                    StartScreen.overlayName,
+                    if (_game.showFps) FpsCounter.overlayName,
+                  ],
                   overlayBuilderMap: {
+                    FpsCounter.overlayName: (context, game) =>
+                        FpsCounter(game: game),
                     StartScreen.overlayName: (context, game) =>
                         StartScreen(game: game),
                     Hud.overlayName: (context, game) => Hud(game: game),
